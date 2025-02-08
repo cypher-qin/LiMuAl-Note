@@ -1,4 +1,11 @@
 # Transformer
+## 写在前面
+代码解释重在关注输入输出形式，以及展示Transformer架构运行的原理  
+本章实现的模块：  
+1.Positionwise FFN  
+2.Add & norm  
+3.串联形成编码器  
+4.串联形成解码器  
 ## 整体结构
 ![alt text](image.png)
 编码器-解码器结构，纯使用注意力，两边都有n个Transformer块
@@ -33,12 +40,24 @@ class PositionWiseFFN(nn.Module):
     def __init__(self, ffn_num_input, ffn_num_hiddens, ffn_num_outputs,
                  **kwargs):
         super(PositionWiseFFN, self).__init__(**kwargs)
+        # 全连接层1
         self.dense1 = nn.Linear(ffn_num_input, ffn_num_hiddens)
+        # 激活函数relu
         self.relu = nn.ReLU()
+        # 全连接层2
         self.dense2 = nn.Linear(ffn_num_hiddens, ffn_num_outputs)
 
     def forward(self, X):
         return self.dense2(self.relu(self.dense1(X)))
+```
+```
+假设模型Token维度d_model
+一般ffn_num_input=ffn_num_outputs=d_model
+即使不等于，也仅仅对最后一个维度进行修改
+输入：X=(batch_size,seq_len,ffn_num_input)
+经过dense1: X1=(batch_size,seq_len,ffn_num_hiddens)
+经过relu函数：X2=(batch_size,seq_len,ffn_num_hiddens)
+经过dense2: output=(batch_size,seq_len,ffn_num_outputs)
 ```
 ### FFN效果展示
 ![alt text](image-6.png)
@@ -51,8 +70,23 @@ class AddNorm(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.ln = nn.LayerNorm(normalized_shape)
 
+    # LayerNorm是归一化操作
+    # self.dropout(Y)+X是残差连接操作
     def forward(self, X, Y):
         return self.ln(self.dropout(Y) + X)
+```
+输入输出形状分析：
+```
+假设Token维度为d_model
+这里X是模块的原始输入，Y是上一级的输出
+输入 X=(batch_size,seq_len,d_model)
+    Y=(batch_size,seq_len,d_model)
+残差连接操作：
+dropout是逐元素操作，不改变形状，相加也不改变
+归一化操作：
+归一化对最后一个维度即d_model进行归一化，也不改变形状
+
+所以输出形状Output=(batch_size,seq_len,d_model)
 ```
 ### 为什么要用层归一化
 ![alt text](image-7.png)
@@ -61,6 +95,7 @@ class AddNorm(nn.Module):
 
 ## 实现一个编码器层
 ```Python
+# 简单堆叠过去实现的模块
 class EncoderBlock(nn.Module):
     def __init__(self, key_size, query_size, value_size, num_hiddens,
                  norm_shape, ffn_num_input, ffn_num_hiddens, num_heads,
@@ -90,7 +125,9 @@ class TransformerEncoder(d2l.Encoder):
         super(TransformerEncoder, self).__init__(**kwargs)
         self.num_hiddens = num_hiddens
         self.embedding = nn.Embedding(vocab_size, num_hiddens)
+        # 位置编码层
         self.pos_encoding = d2l.PositionalEncoding(num_hiddens, dropout)
+        # 一种容器，可以堆叠多个层
         self.blks = nn.Sequential()
         for i in range(num_layers):
             self.blks.add_module(
@@ -100,6 +137,7 @@ class TransformerEncoder(d2l.Encoder):
                              num_heads, dropout, use_bias))
 
     def forward(self, X, valid_lens, *args):
+        # 位置编码+embed
         X = self.pos_encoding(self.embedding(X) * math.sqrt(self.num_hiddens))
         self.attention_weights = [None] * len(self.blks)
         for i, blk in enumerate(self.blks):
@@ -120,26 +158,39 @@ class DecoderBlock(nn.Module):
                  norm_shape, ffn_num_input, ffn_num_hiddens, num_heads,
                  dropout, i, **kwargs):
         super(DecoderBlock, self).__init__(**kwargs)
+        # 标注自身序号
         self.i = i
+        # 自注意力层1
         self.attention1 = d2l.MultiHeadAttention(key_size, query_size,
                                                  value_size, num_hiddens,
                                                  num_heads, dropout)
+        # AddNorm1                                          
         self.addnorm1 = AddNorm(norm_shape, dropout)
+        # 自注意力层2
         self.attention2 = d2l.MultiHeadAttention(key_size, query_size,
                                                  value_size, num_hiddens,
                                                  num_heads, dropout)
+        # AddNorm2
         self.addnorm2 = AddNorm(norm_shape, dropout)
+        # FFN
         self.ffn = PositionWiseFFN(ffn_num_input, ffn_num_hiddens,
                                    num_hiddens)
+        # AddNorm3
         self.addnorm3 = AddNorm(norm_shape, dropout)
 
     def forward(self, X, state):
+        # 提取编码器输出
         enc_outputs, enc_valid_lens = state[0], state[1]
+        # 检查历史缓存信息
         if state[2][self.i] is None:
             key_values = X
         else:
+            # 如果历史信息存在，则在维度1上进行拼接
             key_values = torch.cat((state[2][self.i], X), axis=1)
+        # 更新历史信息
+        # 在这种机制下，第i个模块只能看到第i个词以前的信息
         state[2][self.i] = key_values
+        # 训练的时候由于步长固定，所以生成有效长度数组
         if self.training:
             batch_size, num_steps, _ = X.shape
             dec_valid_lens = torch.arange(1, num_steps + 1,
@@ -148,6 +199,7 @@ class DecoderBlock(nn.Module):
         else:
             dec_valid_lens = None
 
+        # 拼接模块
         X2 = self.attention1(X, key_values, key_values, dec_valid_lens)
         Y = self.addnorm1(X, X2)
         Y2 = self.attention2(Y, enc_outputs, enc_outputs, enc_valid_lens)
@@ -165,9 +217,12 @@ class TransformerDecoder(d2l.AttentionDecoder):
         super(TransformerDecoder, self).__init__(**kwargs)
         self.num_hiddens = num_hiddens
         self.num_layers = num_layers
+        # 处理输入
         self.embedding = nn.Embedding(vocab_size, num_hiddens)
         self.pos_encoding = d2l.PositionalEncoding(num_hiddens, dropout)
+        # 模块容器
         self.blks = nn.Sequential()
+        # 装载模块
         for i in range(num_layers):
             self.blks.add_module(
                 "block" + str(i),
@@ -176,14 +231,19 @@ class TransformerDecoder(d2l.AttentionDecoder):
                              num_heads, dropout, i))
         self.dense = nn.Linear(num_hiddens, vocab_size)
 
+    # 初始化状态
     def init_state(self, enc_outputs, enc_valid_lens, *args):
         return [enc_outputs, enc_valid_lens, [None] * self.num_layers]
 
     def forward(self, X, state):
+        # 输入
         X = self.pos_encoding(self.embedding(X) * math.sqrt(self.num_hiddens))
+        # 初始化注意力权重存储
         self._attention_weights = [[None] * len(self.blks) for _ in range(2)]
         for i, blk in enumerate(self.blks):
+            # forward
             X, state = blk(X, state)
+            # 提取注意力权重
             self._attention_weights[0][
                 i] = blk.attention1.attention.attention_weights
             self._attention_weights[1][
